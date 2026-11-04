@@ -21,6 +21,14 @@ namespace Libraries::Ajm {
 constexpr u32 ORBIS_AJM_WAIT_INFINITE = -1;
 constexpr int INSTANCE_ID_MASK = 0x3FFF;
 
+// Batch ids carry the slot index in the low bits and a sequence number in the high bits, so a
+// freed id is not handed out again right away. Games may wait on a batch id they have already
+// waited on: JoJo's Bizarre Adventure: Eyes of Heaven waits on a voice's last batch again when
+// the voice stops. With plain slot ids that wait would collect another voice's batch, and that
+// voice would then poll a missing batch forever (voice lines cutting out).
+constexpr u32 BATCH_SLOT_BITS = 16;
+constexpr u32 BATCH_SLOT_MASK = (1U << BATCH_SLOT_BITS) - 1;
+
 AjmContext::AjmContext() {
     worker_thread = std::jthread([this](std::stop_token stop) { this->WorkerThread(stop); });
 }
@@ -29,15 +37,26 @@ bool AjmContext::IsRegistered(AjmCodecType type) const {
     return registered_codecs[std::to_underlying(type)];
 }
 
+std::shared_ptr<AjmBatch> AjmContext::FindBatch(u32 batch_id) {
+    const u32 slot = batch_id & BATCH_SLOT_MASK;
+    if (slot < 1 || slot >= MaxBatches) {
+        return nullptr;
+    }
+    const auto p_batch = batches.Get(slot);
+    if (p_batch == nullptr || (*p_batch)->id != batch_id) {
+        return nullptr;
+    }
+    return *p_batch;
+}
+
 s32 AjmContext::BatchCancel(const u32 batch_id) {
     std::shared_ptr<AjmBatch> batch{};
     {
         std::shared_lock guard(batches_mutex);
-        const auto p_batch = batches.Get(batch_id);
-        if (p_batch == nullptr) {
+        batch = FindBatch(batch_id);
+        if (batch == nullptr) {
             return ORBIS_AJM_ERROR_INVALID_BATCH;
         }
-        batch = *p_batch;
     }
 
     if (batch->processed) {
@@ -99,11 +118,10 @@ s32 AjmContext::BatchWait(const u32 batch_id, const u32 timeout, AjmBatchError* 
     std::shared_ptr<AjmBatch> batch{};
     {
         std::shared_lock guard(batches_mutex);
-        const auto p_batch = batches.Get(batch_id);
-        if (p_batch == nullptr) {
+        batch = FindBatch(batch_id);
+        if (batch == nullptr) {
             return ORBIS_AJM_ERROR_INVALID_BATCH;
         }
-        batch = *p_batch;
     }
 
     bool expected = false;
@@ -120,7 +138,7 @@ s32 AjmContext::BatchWait(const u32 batch_id, const u32 timeout, AjmBatchError* 
 
     {
         std::unique_lock guard(batches_mutex);
-        batches.Destroy(batch_id);
+        batches.Destroy(batch_id & BATCH_SLOT_MASK);
     }
 
     if (batch->canceled) {
@@ -138,16 +156,16 @@ int AjmContext::BatchStartBuffer(u8* p_batch, u32 batch_size, const int priority
     }
 
     const auto batch_info = AjmBatch::FromBatchBuffer({p_batch, batch_size});
-    std::optional<u32> batch_id;
     {
         std::unique_lock guard(batches_mutex);
-        batch_id = batches.Create(batch_info);
+        const auto slot = batches.Create(batch_info);
+        if (!slot.has_value()) {
+            return ORBIS_AJM_ERROR_OUT_OF_MEMORY;
+        }
+        batch_sequence = (batch_sequence + 1) & (u32(-1) >> BATCH_SLOT_BITS);
+        batch_info->id = (batch_sequence << BATCH_SLOT_BITS) | slot.value();
     }
-    if (!batch_id.has_value()) {
-        return ORBIS_AJM_ERROR_OUT_OF_MEMORY;
-    }
-    *out_batch_id = batch_id.value();
-    batch_info->id = *out_batch_id;
+    *out_batch_id = batch_info->id;
 
     if (!batch_info->jobs.empty()) {
         batch_queue.EmplaceWait(batch_info);

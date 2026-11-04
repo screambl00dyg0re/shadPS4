@@ -41,6 +41,8 @@ private:
     static constexpr u32 NumAjmCodecs = std::to_underlying(AjmCodecType::Max);
 
     [[nodiscard]] bool IsRegistered(AjmCodecType type) const;
+    // Looks up a batch by its public id; the caller holds batches_mutex.
+    [[nodiscard]] std::shared_ptr<AjmBatch> FindBatch(u32 batch_id);
 
     std::array<bool, NumAjmCodecs> registered_codecs{};
 
@@ -49,6 +51,7 @@ private:
 
     std::shared_mutex batches_mutex;
     Common::SlotArray<u32, std::shared_ptr<AjmBatch>, MaxBatches, 1> batches;
+    u32 batch_sequence{}; // guarded by batches_mutex
 
     std::jthread worker_thread{};
     Common::MPSCQueue<std::shared_ptr<AjmBatch>> batch_queue;
